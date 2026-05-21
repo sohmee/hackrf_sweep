@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+*.png
+*.jpg
+*.wav
+*.raw
+*.bin
+.DS_Store
+Thumbs.db
