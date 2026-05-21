@@ -12,7 +12,7 @@ Created by [sohmee](https://github.com/sohmee) — feedback and contributions we
 
 ## 📸 Screenshots
 
-> *(Screenshots coming — contributors welcome to add theirs via pull request)*
+![HackRF Sweep waterfall](screenshots/screenshot.png)
 
 ---
 
