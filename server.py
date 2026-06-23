@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HackRF Sweep — by sohmee  https://github.com/sohmee
+HackRF Sweep — by G4EA5  https://github.com/G4EA5/hackrf_sweep
 Requirements: pip3 install flask flask-sock
               sudo apt install hackrf lsof psmisc
 """
@@ -744,8 +744,8 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
 <div class="mbox">
   <button class="mcl" onclick="closeModal('help-modal')">✕ CLOSE</button>
   <h2>HackRF Sweep — Help Guide</h2>
-  <p style="color:var(--dim);font-size:12px">Created by <a href="https://github.com/sohmee" target="_blank"
-     style="color:var(--a2)">sohmee @ github.com/sohmee</a></p>
+  <p style="color:var(--dim);font-size:12px">Created by <a href="https://github.com/G4EA5" target="_blank"
+     style="color:var(--a2)">G4EA5 @ github.com/G4EA5</a></p>
 
   <h3>What is this?</h3>
   <p>A real-time radio spectrum analyser. Your HackRF One scans a frequency range and draws a <b>waterfall</b> (time scrolls down, bright = strong signal) and a <b>spectrum graph</b> (power vs frequency).</p>
@@ -832,7 +832,7 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
   <h3>Firmware</h3>
   <p>2018.01.1+ recommended. github.com/greatscottgadgets/hackrf/releases</p>
   <h3>Credits</h3>
-  <p>Created by <a href="https://github.com/sohmee" target="_blank" style="color:var(--a2)">sohmee</a> — github.com/sohmee</p>
+  <p>Created by <a href="https://github.com/G4EA5" target="_blank" style="color:var(--a2)">G4EA5</a> — github.com/G4EA5/hackrf_sweep</p>
 </div></div>
 
 <script>
@@ -1233,7 +1233,7 @@ function exportPNG(){
   tc.drawImage(wfCanvas,0,rulerCanvas.height+specCanvas.height);
   tc.fillStyle='rgba(0,0,0,.6)'; tc.fillRect(0,totalH-22,400,22);
   tc.fillStyle='#00ff88'; tc.font='12px Share Tech Mono';
-  tc.fillText(`HackRF ${freqStart}–${freqEnd} MHz  ${new Date().toLocaleString()}  github.com/sohmee`,
+  tc.fillText(`HackRF ${freqStart}–${freqEnd} MHz  ${new Date().toLocaleString()}  github.com/G4EA5/hackrf_sweep`,
               6, totalH-6);
   const a=document.createElement('a');
   a.download=`hackrf_${freqStart}-${freqEnd}MHz_${Date.now()}.png`;

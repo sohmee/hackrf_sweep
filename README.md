@@ -1,12 +1,9 @@
 # ⬡ HackRF Sweep — Real-Time Browser-Based Spectrum Analyser
 
-> **⚠ UNDER ACTIVE DEVELOPMENT — BETA / TESTING**  
-> This project is currently being tested and refined. If you try it, please open an Issue or leave feedback — all bug reports, suggestions and pull requests are very welcome!
-
 **A fully browser-based real-time radio spectrum analyser for the HackRF One SDR.**  
 Scan any frequency from 1 MHz to 6 GHz and view a live waterfall + spectrum display in any web browser — on any device on your network. No desktop app, no GUI toolkit, just Python and a browser.
 
-Created by [sohmee](https://github.com/sohmee) — feedback and contributions welcome!
+Created by [G4EA5](https://github.com/G4EA5) — bug reports, suggestions and pull requests welcome.
 
 ---
 
@@ -285,8 +282,8 @@ Then open your Windows browser and go to `http://localhost:8085`
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/sohmee/hackrf-sweep.git
-cd hackrf-sweep
+git clone https://github.com/G4EA5/hackrf_sweep.git
+cd hackrf_sweep
 
 # 2. Install Python dependencies
 pip3 install flask flask-sock
@@ -548,7 +545,7 @@ app.run(host="127.0.0.1", port=8085, threaded=True)
 
 ## 🤝 Contributing
 
-Contributions, bug reports and feature suggestions are very welcome — this project is under active development and early testing.
+Contributions, bug reports and feature suggestions are welcome.
 
 ### Reporting Bugs
 Please open a GitHub Issue and include:
@@ -589,11 +586,11 @@ MIT Licence — free to use, modify and distribute. See [LICENSE](LICENSE) for f
 
 ## 📬 Contact & Feedback
 
-- GitHub: [github.com/sohmee](https://github.com/sohmee)
-- Issues: [github.com/sohmee/hackrf-sweep/issues](https://github.com/sohmee/hackrf-sweep/issues)
+- GitHub: [github.com/G4EA5](https://github.com/G4EA5)
+- Issues: [github.com/G4EA5/hackrf_sweep/issues](https://github.com/G4EA5/hackrf_sweep/issues)
 
 If you find this useful, a ⭐ star on GitHub is always appreciated and helps others find the project!
 
 ---
 
-*HackRF Sweep — created by [sohmee](https://github.com/sohmee)*
+*HackRF Sweep — created by [G4EA5](https://github.com/G4EA5)*
