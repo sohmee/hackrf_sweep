@@ -14,10 +14,24 @@ MY_PID = os.getpid()
 
 sweep_proc   = None
 sweep_lock   = threading.Lock()
-stdout_q     = queue.Queue(maxsize=2000)
+stdout_q     = queue.Queue(maxsize=8000)
 stderr_q     = queue.Queue(maxsize=500)
 # monotonically increasing sweep generation — used to discard stale stdout data
 sweep_gen    = 0
+dropped_lines = 0
+drop_lock     = threading.Lock()
+
+def _note_drop(n=1):
+    global dropped_lines
+    with drop_lock:
+        dropped_lines += n
+
+def _take_drops():
+    global dropped_lines
+    with drop_lock:
+        n = dropped_lines
+        dropped_lines = 0
+        return n
 
 def _drain_stdout(proc, gen):
     """Thread: forward stdout only if this proc is still the current generation."""
@@ -29,8 +43,20 @@ def _drain_stdout(proc, gen):
                 cur = sweep_gen
             if gen != cur:
                 break          # this is a stale process, stop forwarding
-            try: stdout_q.put_nowait(line)
-            except queue.Full: pass
+            while True:
+                with sweep_lock:
+                    if gen != sweep_gen:
+                        return
+                try:
+                    stdout_q.put(line, timeout=0.25)
+                    break
+                except queue.Full:
+                    # Backpressure: drop oldest line so the stream stays live.
+                    try:
+                        stdout_q.get_nowait()
+                        _note_drop()
+                    except queue.Empty:
+                        _note_drop()
     except Exception: pass
 
 def _drain_stderr(proc, gen):
@@ -182,14 +208,28 @@ def ws_route(ws):
                 send_status(lvl, f"hackrf: {ln}")
 
         sent = 0
+        batch = min(500, max(40, stdout_q.qsize() + 1))
         try:
-            while sent < 20:
+            while sent < batch:
                 line = stdout_q.get_nowait()
                 try: ws.send(line + '\n')
                 except Exception: return
                 sent += 1
                 last_data_time = time.time()
         except queue.Empty: pass
+
+        drops = _take_drops()
+        if drops:
+            send_status("warn",
+                f"Dropped {drops} stale sweep line(s) — USB/CPU backlog. "
+                "Try 250 kHz bin width or a narrower span.")
+            if drops >= 25:
+                send_status("warn", "Heavy backlog — restarting hackrf_sweep…")
+                proc, cur_start, cur_end = start_sweep(cur_start, cur_end)
+                send_status("info", "hackrf_sweep restarted (backlog)")
+                send_range(cur_start, cur_end)
+                last_data_time = time.time()
+                continue
 
         with sweep_lock:
             p = sweep_proc
@@ -866,6 +906,7 @@ let markers=[], markerMode=false;
 let sweepActive=false;
 let sweepBins=[], sweepFreqLow=null, sweepFreqHigh=null;
 let expectedStartHz=null;
+let lastChunkHzHigh=null;
 let lineBuf='', ws=null;
 let gainDebounceTimer=null, freqTimer=null, resizeTimer=null;
 let currentQB=null;  // id of active quick-band button
@@ -988,7 +1029,7 @@ function resize(){
   wfY=0;
   wfCtx.fillStyle='#000'; wfCtx.fillRect(0,0,W,wfH);
   // reset accumulator only — freqStart/freqEnd stay correct
-  sweepBins=[]; sweepFreqLow=null; sweepFreqHigh=null; expectedStartHz=null;
+  resetSweepAssembly();
   drawRuler(); updateDbAxis();
 }
 window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(resize,120)});
@@ -1114,6 +1155,26 @@ function drawWaterfallLine(bins){
 }
 
 // ═══════════════════════════════════════════════════════════
+// SWEEP ASSEMBLY — reject partial/corrupt passes (backlog drops)
+// ═══════════════════════════════════════════════════════════
+function expectedSweepBins(){
+  const spanMhz=Math.max(1, freqEnd-freqStart);
+  const bw=Math.max(50000, +document.getElementById('binwidth').value||100000);
+  return Math.max(8, Math.round(spanMhz*1e6/bw));
+}
+
+function sweepLooksComplete(){
+  const exp=expectedSweepBins();
+  const tol=Math.max(12, Math.round(exp*0.35));
+  return sweepBins.length >= Math.max(4, exp - tol);
+}
+
+function resetSweepAssembly(){
+  sweepBins=[]; sweepFreqLow=null; sweepFreqHigh=null;
+  expectedStartHz=null; lastChunkHzHigh=null;
+}
+
+// ═══════════════════════════════════════════════════════════
 // WATERFALL RESET — wipes canvas, resets all accumulators
 // Does NOT change freqStart/freqEnd — those come from server
 // ═══════════════════════════════════════════════════════════
@@ -1123,7 +1184,7 @@ function resetWaterfall(){
   peakBuf=new Float32Array(wfCanvas.width).fill(-999);
   avgBuf =new Float32Array(wfCanvas.width).fill(-999);
   if(wfAccumBuf) wfAccumBuf.fill(-999); wfAccumCount=0;
-  sweepBins=[]; sweepFreqLow=null; sweepFreqHigh=null; expectedStartHz=null;
+  resetSweepAssembly();
   // Mark as inactive — will reactivate when server sends "range" message
   sweepActive=false;
 }
@@ -1438,8 +1499,8 @@ function connect(){
   };
   ws.onerror=()=>logMsg('error','WebSocket error — check server is running');
 
-  lineBuf=''; sweepBins=[]; sweepFreqLow=null; sweepFreqHigh=null;
-  expectedStartHz=null; sweepActive=false;
+  lineBuf=''; resetSweepAssembly();
+  sweepActive=false;
 
   ws.onmessage=(ev)=>{
     const raw=ev.data;
@@ -1497,7 +1558,7 @@ function connect(){
       // detect new sweep pass
       const isNewSweep=sweepFreqLow!==null && hzLow<=expectedStartHz+5e4;
       if(isNewSweep){
-        if(sweepBins.length>=4){
+        if(sweepLooksComplete()){
           latestBins=sweepBins.slice();
           drawSpectrum(latestBins);
           drawWaterfallLine(latestBins);
@@ -1510,12 +1571,25 @@ function connect(){
             document.getElementById('info-rate').textContent=rateCount;
             rateCount=0; lastRateTs=now;
           }
+        } else if(sweepBins.length>=4){
+          logMsg('warn',`Skipped partial sweep (${sweepBins.length}/${expectedSweepBins()} bins)`);
         }
-        sweepBins=[]; sweepFreqLow=hzLow; sweepFreqHigh=hzHigh;
+        resetSweepAssembly();
+        expectedStartHz=hzLow;
+        sweepFreqLow=hzLow; sweepFreqHigh=hzHigh;
+        lastChunkHzHigh=hzHigh;
       } else {
         if(sweepFreqLow===null)  sweepFreqLow=hzLow;
         if(sweepFreqHigh===null) sweepFreqHigh=hzHigh;
-        else sweepFreqHigh=Math.max(sweepFreqHigh,hzHigh);
+        else {
+          if(lastChunkHzHigh!==null && hzLow > lastChunkHzHigh + 2e6){
+            logMsg('warn','Sweep gap detected — discarding partial frame');
+            resetSweepAssembly();
+            expectedStartHz=hzLow;
+          }
+          sweepFreqHigh=Math.max(sweepFreqHigh,hzHigh);
+        }
+        lastChunkHzHigh=hzHigh;
       }
 
       // ── Clip bins to confirmed frequency range ──────────────
