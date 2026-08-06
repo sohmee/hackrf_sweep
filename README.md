@@ -5,6 +5,8 @@ Scan any frequency from 1 MHz to 6 GHz and view a live waterfall + spectrum disp
 
 Created by [G4EA5](https://github.com/G4EA5) — bug reports, suggestions and pull requests welcome.
 
+**Versions:** `main` is current. Pre-fix code (Aug 2026) is on branch [`legacy/v1.0.0`](https://github.com/G4EA5/hackrf_sweep/tree/legacy/v1.0.0) — use `git clone -b legacy/v1.0.0 …` if you want the previous release.
+
 ---
 
 ## 📸 Screenshots
@@ -425,6 +427,12 @@ Start with LNA=16, VGA=20, AMP=OFF. If signals look weak, increase LNA first, th
 - Increase bin width (BIN W slider) — larger bins = fewer samples = faster sweep
 - Close other applications using CPU
 - On Raspberry Pi, a narrower span (20–40 MHz) is recommended for smooth performance
+
+### Waterfall starts OK then "crumbles" (LattePanda, Pi, low-power hosts)
+- Usually CSV backlog: the server drops sweep lines when USB/CPU can't keep up
+- Try **250 kHz** bin width and a **20 MHz** span; use a **powered USB hub** for the HackRF
+- Open the browser on another machine on the LAN so the SDR host isn't also rendering
+- Check the Console panel for `Dropped N stale sweep line(s)` warnings
 
 ### Permission denied / can't open device
 - Run with `sudo python3 server.py`
