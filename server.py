@@ -20,6 +20,9 @@ stderr_q     = queue.Queue(maxsize=500)
 sweep_gen    = 0
 dropped_lines = 0
 drop_lock     = threading.Lock()
+last_drop_warn = 0.0
+# preserved across auto-restarts so crash recovery keeps bin width / gains
+current_sweep = {"start": 88, "end": 108, "lna": 16, "vga": 20, "amp": 0, "binwidth": 100000}
 
 def _note_drop(n=1):
     global dropped_lines
@@ -116,8 +119,8 @@ def stop_sweep():
             while True: q.get_nowait()
         except queue.Empty: pass
 
-def start_sweep(start, end, lna=16, vga=20, amp=0, binwidth=100000):
-    global sweep_proc, sweep_gen
+def start_sweep(start, end, lna=16, vga=20, amp=0, binwidth=100000, force_kill=False):
+    global sweep_proc, sweep_gen, current_sweep
     start    = max(1,    min(5980, int(start)))
     end      = max(21,   min(6000, int(end)))
     lna      = max(0,    min(40,   int(lna)))
@@ -125,9 +128,14 @@ def start_sweep(start, end, lna=16, vga=20, amp=0, binwidth=100000):
     amp      = 1 if int(amp) else 0
     binwidth = max(50000, min(1000000, int(binwidth)))
     if end <= start: end = start + 20
+    current_sweep = {"start": start, "end": end, "lna": lna, "vga": vga,
+                     "amp": amp, "binwidth": binwidth}
 
     stop_sweep()           # kills old proc AND increments sweep_gen
-    kill_hackrf_users()    # belt-and-braces
+    if force_kill:
+        kill_hackrf_users()    # belt-and-braces — startup / stuck device only
+    else:
+        time.sleep(0.2)        # brief USB settle after normal stop
 
     cmd = ["hackrf_sweep",
            "-f", f"{start}:{end}",
@@ -145,49 +153,71 @@ def start_sweep(start, end, lna=16, vga=20, amp=0, binwidth=100000):
     threading.Thread(target=_drain_stderr, args=(proc,gen), daemon=True).start()
     return proc, start, end      # return actual clamped values
 
+def restart_current_sweep(force_kill=False):
+    """Restart hackrf_sweep with the last confirmed UI settings."""
+    s = current_sweep
+    return start_sweep(s["start"], s["end"], lna=s["lna"], vga=s["vga"],
+                       amp=s["amp"], binwidth=s["binwidth"], force_kill=force_kill)
+
 @sock.route('/ws')
 def ws_route(ws):
     cur_start, cur_end = 88, 108
-    proc, cur_start, cur_end = start_sweep(cur_start, cur_end)
+    proc = None
+    started = False
+    connect_t = time.time()
 
     def send_status(level, msg):
         try: ws.send(json.dumps({"type":"status","level":level,"msg":msg}))
         except Exception: pass
 
-    def send_range(s, e):
+    def send_range(s, e, soft=False):
         """Tell browser the confirmed active frequency range after old proc is dead."""
-        try: ws.send(json.dumps({"type":"range","start":s,"end":e}))
+        try:
+            ws.send(json.dumps({
+                "type": "range", "start": s, "end": e, "soft": soft,
+                "binwidth": current_sweep["binwidth"],
+            }))
         except Exception: pass
 
-    send_status("info", f"hackrf_sweep started {cur_start}–{cur_end} MHz")
-    send_range(cur_start, cur_end)
+    def apply_sweep_cmd(d):
+        nonlocal proc, cur_start, cur_end, started
+        s = max(1,   min(5980, int(float(d.get("start", 88)))))
+        e = max(21,  min(6000, int(float(d.get("end",  108)))))
+        proc, cur_start, cur_end = start_sweep(s, e,
+            lna=d.get("lna",16), vga=d.get("vga",20),
+            amp=d.get("amp",0), binwidth=d.get("binwidth",100000))
+        started = True
+        send_status("info", f"Sweep: {cur_start}–{cur_end} MHz")
+        send_range(cur_start, cur_end, soft=False)
+        return time.time()
 
     last_stderr_flush = time.time()
     last_data_time    = time.time()
     stderr_line_count = 0   # for throttling
 
     while True:
-        try:
-            msg = ws.receive(timeout=0.01)
-        except Exception:
-            msg = None
+        qsize = stdout_q.qsize()
+        msg = None
+        if qsize < 120:
+            try:
+                msg = ws.receive(timeout=0.002 if qsize > 40 else 0.01)
+            except Exception:
+                msg = None
 
         if msg:
             try:
                 d = json.loads(msg)
                 if d.get("cmd") == "setSweep":
-                    s = max(1,   min(5980, int(float(d.get("start", 88)))))
-                    e = max(21,  min(6000, int(float(d.get("end",  108)))))
-                    proc, cur_start, cur_end = start_sweep(s, e,
-                        lna=d.get("lna",16), vga=d.get("vga",20),
-                        amp=d.get("amp",0), binwidth=d.get("binwidth",100000))
-                    send_status("info", f"Sweep: {cur_start}–{cur_end} MHz")
-                    # Send confirmed range AFTER start_sweep returns
-                    # (old proc is dead, stdout_q is drained, new proc running)
-                    send_range(cur_start, cur_end)
-                    last_data_time = time.time()
+                    last_data_time = apply_sweep_cmd(d)
             except Exception as e2:
                 send_status("error", f"Command error: {e2}")
+
+        if not started and (time.time() - connect_t) > 0.6:
+            proc, cur_start, cur_end = start_sweep(cur_start, cur_end, force_kill=True)
+            started = True
+            send_status("info", f"hackrf_sweep started {cur_start}–{cur_end} MHz")
+            send_range(cur_start, cur_end, soft=False)
+            last_data_time = time.time()
 
         now = time.time()
         if now - last_stderr_flush > 0.3:
@@ -207,8 +237,9 @@ def ws_route(ws):
                      "usage","open","board"]) else "warn"
                 send_status(lvl, f"hackrf: {ln}")
 
+        qsize = stdout_q.qsize()
         sent = 0
-        batch = min(500, max(40, stdout_q.qsize() + 1))
+        batch = min(800, max(60, qsize + 1))
         try:
             while sent < batch:
                 line = stdout_q.get_nowait()
@@ -220,16 +251,14 @@ def ws_route(ws):
 
         drops = _take_drops()
         if drops:
-            send_status("warn",
-                f"Dropped {drops} stale sweep line(s) — USB/CPU backlog. "
-                "Try 250 kHz bin width or a narrower span.")
-            if drops >= 25:
-                send_status("warn", "Heavy backlog — restarting hackrf_sweep…")
-                proc, cur_start, cur_end = start_sweep(cur_start, cur_end)
-                send_status("info", "hackrf_sweep restarted (backlog)")
-                send_range(cur_start, cur_end)
-                last_data_time = time.time()
-                continue
+            global last_drop_warn
+            if now - last_drop_warn > 12:
+                last_drop_warn = now
+                send_status("warn",
+                    f"Dropped {drops} stale sweep line(s) — USB/CPU backlog. "
+                    "Try 250 kHz bin width or a narrower span.")
+            # Do NOT restart hackrf here — dropping oldest lines keeps the pipe
+            # live; killing/reopening USB makes stalls worse (issue #1).
 
         with sweep_lock:
             p = sweep_proc
@@ -237,15 +266,15 @@ def ws_route(ws):
             send_status("error",
                 f"hackrf_sweep exited (rc={p.returncode}). Retrying in 3s…")
             time.sleep(3)
-            proc, cur_start, cur_end = start_sweep(cur_start, cur_end)
+            proc, cur_start, cur_end = restart_current_sweep(force_kill=True)
             send_status("info","hackrf_sweep restarted")
-            send_range(cur_start, cur_end)
+            send_range(cur_start, cur_end, soft=True)
             last_data_time = time.time()
         elif sent == 0 and (time.time() - last_data_time) > 8:
             send_status("warn","No data for 8s — restarting…")
-            proc, cur_start, cur_end = start_sweep(cur_start, cur_end)
+            proc, cur_start, cur_end = restart_current_sweep(force_kill=True)
             send_status("info","hackrf_sweep restarted (stall)")
-            send_range(cur_start, cur_end)
+            send_range(cur_start, cur_end, soft=True)
             last_data_time = time.time()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -910,6 +939,7 @@ let lastChunkHzHigh=null;
 let lineBuf='', ws=null;
 let gainDebounceTimer=null, freqTimer=null, resizeTimer=null;
 let currentQB=null;  // id of active quick-band button
+let lastPartialWarn=0;
 
 // ═══════════════════════════════════════════════════════════
 // CONSOLE  — throttle DOM updates, max 200 lines
@@ -1165,8 +1195,9 @@ function expectedSweepBins(){
 
 function sweepLooksComplete(){
   const exp=expectedSweepBins();
-  const tol=Math.max(12, Math.round(exp*0.35));
-  return sweepBins.length >= Math.max(4, exp - tol);
+  // Lenient threshold — strict rejection left the waterfall blank on some hosts.
+  const need=Math.max(4, Math.min(exp, Math.round(exp*0.45)));
+  return sweepBins.length >= need;
 }
 
 function resetSweepAssembly(){
@@ -1490,6 +1521,7 @@ function connect(){
     document.getElementById('sdot').className='ok';
     document.getElementById('stxt').textContent='connected';
     logMsg('info','WebSocket connected');
+    sendSweepConfig();  // sync saved UI settings before/at sweep start
   };
   ws.onclose=()=>{
     document.getElementById('sdot').className='err';
@@ -1517,19 +1549,25 @@ function connect(){
           return;
         }
         if(d.type==='range'){
-          // *** THE CORE FIX ***
           // Server has killed the old process, drained the queue,
           // and started the new process. Only NOW do we update our
           // frequency mapping and re-enable data acceptance.
           freqStart=d.start; freqEnd=d.end;
           document.getElementById('end-display').textContent=d.end;
           document.title=`HackRF ${d.start}–${d.end} MHz`;
-          // Wipe all stale display data now that we know the real range
-          resetWaterfall();
-          sweepActive=true;  // start accepting CSV lines
+          const soft=!!d.soft;
+          if(soft){
+            // Crash/stall recovery — keep waterfall history, just reset assembly.
+            resetSweepAssembly();
+            sweepActive=true;
+            logMsg('info',`Range reconfirmed: ${d.start}–${d.end} MHz — resuming`);
+          } else {
+            resetWaterfall();
+            sweepActive=true;
+            logMsg('info',`Range confirmed: ${d.start}–${d.end} MHz — waterfall active`);
+          }
           drawRuler(); updateDbAxis();
           highlightCurrentBand();
-          logMsg('info',`Range confirmed: ${d.start}–${d.end} MHz — waterfall active`);
           return;
         }
       }catch(e){}
@@ -1572,7 +1610,11 @@ function connect(){
             rateCount=0; lastRateTs=now;
           }
         } else if(sweepBins.length>=4){
-          logMsg('warn',`Skipped partial sweep (${sweepBins.length}/${expectedSweepBins()} bins)`);
+          const now=Date.now();
+          if(now-lastPartialWarn>5000){
+            lastPartialWarn=now;
+            logMsg('warn',`Skipped partial sweep (${sweepBins.length}/${expectedSweepBins()} bins)`);
+          }
         }
         resetSweepAssembly();
         expectedStartHz=hzLow;
@@ -1611,6 +1653,7 @@ function connect(){
 // ═══════════════════════════════════════════════════════════
 function sendSweepConfig(){
   if(!ws||ws.readyState!==1){logMsg('warn','Not connected');return;}
+  sweepActive=false;  // discard stale CSV until server confirms range
   const s   =Math.max(1,Math.min(5980,+document.getElementById('start').value||88));
   const span=getSpanMhz();
   const e   =Math.min(6000,s+span);

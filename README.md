@@ -429,10 +429,10 @@ Start with LNA=16, VGA=20, AMP=OFF. If signals look weak, increase LNA first, th
 - On Raspberry Pi, a narrower span (20–40 MHz) is recommended for smooth performance
 
 ### Waterfall starts OK then "crumbles" (LattePanda, Pi, low-power hosts)
-- Usually CSV backlog: the server drops sweep lines when USB/CPU can't keep up
+- Usually CSV backlog: the server drops oldest sweep lines when USB/CPU can't keep up (this is normal — it keeps the display live)
 - Try **250 kHz** bin width and a **20 MHz** span; use a **powered USB hub** for the HackRF
 - Open the browser on another machine on the LAN so the SDR host isn't also rendering
-- Check the Console panel for `Dropped N stale sweep line(s)` warnings
+- Drop warnings are rate-limited to once every ~12 s — if `hackrf_sweep` exits with "Couldn't transfer any data", check USB cable/port and avoid restarting the server in a loop
 
 ### Permission denied / can't open device
 - Run with `sudo python3 server.py`
