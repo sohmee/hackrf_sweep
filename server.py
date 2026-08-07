@@ -15,12 +15,14 @@ MY_PID = os.getpid()
 sweep_proc   = None
 sweep_lock   = threading.Lock()
 stdout_q     = queue.Queue(maxsize=8000)
+sweep_q      = queue.Queue(maxsize=400)   # complete sweeps ready for browser
 stderr_q     = queue.Queue(maxsize=500)
 # monotonically increasing sweep generation — used to discard stale stdout data
 sweep_gen    = 0
 dropped_lines = 0
 drop_lock     = threading.Lock()
 last_drop_warn = 0.0
+_assembler_lock = threading.Lock()
 # preserved across auto-restarts so crash recovery keeps bin width / gains
 current_sweep = {"start": 88, "end": 108, "lna": 16, "vga": 20, "amp": 0, "binwidth": 100000}
 
@@ -35,6 +37,69 @@ def _take_drops():
         n = dropped_lines
         dropped_lines = 0
         return n
+
+def _parse_line_hz_low(line):
+    parts = line.split(",")
+    if len(parts) < 4:
+        return None
+    try:
+        return float(parts[2])
+    except ValueError:
+        return None
+
+def _put_complete_sweep(text):
+    try:
+        sweep_q.put_nowait(text)
+    except queue.Full:
+        try:
+            sweep_q.get_nowait()
+            _note_drop()
+        except queue.Empty:
+            pass
+        try:
+            sweep_q.put_nowait(text)
+        except queue.Full:
+            _note_drop()
+
+def _reset_sweep_assembler():
+    with _assembler_lock:
+        _sweep_assembler_state["pending"] = []
+        _sweep_assembler_state["start_hz"] = None
+    try:
+        while True:
+            sweep_q.get_nowait()
+    except queue.Empty:
+        pass
+
+_sweep_assembler_state = {"pending": [], "start_hz": None}
+
+def _feed_sweep_assembler(line):
+    """Group hackrf_sweep CSV lines into complete sweeps (never send partial)."""
+    hz_low = _parse_line_hz_low(line)
+    if hz_low is None:
+        return
+    with _assembler_lock:
+        st = _sweep_assembler_state
+        pending = st["pending"]
+        start_hz = st["start_hz"]
+        if pending and start_hz is not None and hz_low <= start_hz + 50000:
+            _put_complete_sweep("\n".join(pending) + "\n")
+            st["pending"] = [line]
+            st["start_hz"] = hz_low
+            return
+        if not pending:
+            st["start_hz"] = hz_low
+        pending.append(line)
+
+def _sweep_assembler_loop():
+    while True:
+        try:
+            line = stdout_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        _feed_sweep_assembler(line)
+
+threading.Thread(target=_sweep_assembler_loop, daemon=True).start()
 
 def _drain_stdout(proc, gen):
     """Thread: forward stdout only if this proc is still the current generation."""
@@ -113,11 +178,12 @@ def stop_sweep():
     if proc:
         try: proc.kill(); proc.wait(timeout=2)
         except Exception: pass
-    # drain queues — discard all stale lines
+    # drain queues — discard all stale lines / assembled sweeps
     for q in (stdout_q, stderr_q):
         try:
             while True: q.get_nowait()
         except queue.Empty: pass
+    _reset_sweep_assembler()
 
 def start_sweep(start, end, lna=16, vga=20, amp=0, binwidth=100000, force_kill=False):
     global sweep_proc, sweep_gen, current_sweep
@@ -200,7 +266,7 @@ def ws_route(ws):
     last_data_time    = time.time()
 
     while True:
-        qsize = stdout_q.qsize()
+        qsize = sweep_q.qsize()
         msg = None
         if qsize < 120:
             try:
@@ -241,23 +307,21 @@ def ws_route(ws):
                     continue
                 send_status(lvl, f"hackrf: {ln}")
 
-        qsize = stdout_q.qsize()
+        qsize = sweep_q.qsize()
         sent = 0
-        # Decimate to the browser when the queue backs up (remote viewer on LAN).
-        skip = 1 if qsize < 200 else (2 if qsize < 500 else 3)
-        batch = min(400, max(40, qsize // skip + 1))
-        skip_i = 0
+        # Send whole sweeps only — never partial CSV lines (prevents smeared remote display).
+        batch = min(80, max(8, qsize // 2 + 1))
         try:
             while sent < batch:
-                line = stdout_q.get_nowait()
-                skip_i += 1
-                if skip_i % skip != 0:
-                    continue
-                try: ws.send(line + '\n')
-                except Exception: return
+                sweep = sweep_q.get_nowait()
+                try:
+                    ws.send(sweep)
+                except Exception:
+                    return
                 sent += 1
                 last_data_time = time.time()
-        except queue.Empty: pass
+        except queue.Empty:
+            pass
 
         drops = _take_drops()
         if drops:
@@ -265,8 +329,8 @@ def ws_route(ws):
             if now - last_drop_warn > 30:
                 last_drop_warn = now
                 send_status("warn",
-                    f"Display backlog: skipped {drops} old sweep line(s). "
-                    "This is normal with a remote browser — try 250 kHz bin width.")
+                    f"Display backlog: skipped {drops} old sweep(s) to stay live. "
+                    "Try 250 kHz bin width or view locally on the SDR host.")
 
         with sweep_lock:
             p = sweep_proc
@@ -1202,9 +1266,9 @@ function expectedSweepBins(){
 }
 
 function sweepLooksComplete(){
-  // Legacy threshold — strict checks left the waterfall blank when lines were
-  // decimated over LAN (remote viewer cannot keep up with 400 raw lines/s).
-  return sweepBins.length >= 4;
+  const exp=expectedSweepBins();
+  // Require most of the expected bins — partial sweeps smear when stretched to canvas width.
+  return sweepBins.length >= Math.max(8, Math.floor(exp * 0.85));
 }
 
 function resetSweepAssembly(){
@@ -1601,7 +1665,7 @@ function connect(){
       // detect new sweep pass
       const isNewSweep=sweepFreqLow!==null && hzLow<=expectedStartHz+5e4;
         if(isNewSweep){
-        if(sweepBins.length>=4){
+        if(sweepLooksComplete()){
           latestBins=sweepBins.slice();
           drawSpectrum(latestBins);
           drawWaterfallLine(latestBins);
