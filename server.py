@@ -179,8 +179,10 @@ def ws_route(ws):
             }))
         except Exception: pass
 
-    def apply_sweep_cmd(d):
+    def apply_sweep_cmd(d, first=False):
         nonlocal proc, cur_start, cur_end, started
+        was_started = started
+        prev = dict(current_sweep) if was_started else None
         s = max(1,   min(5980, int(float(d.get("start", 88)))))
         e = max(21,  min(6000, int(float(d.get("end",  108)))))
         proc, cur_start, cur_end = start_sweep(s, e,
@@ -188,12 +190,14 @@ def ws_route(ws):
             amp=d.get("amp",0), binwidth=d.get("binwidth",100000))
         started = True
         send_status("info", f"Sweep: {cur_start}–{cur_end} MHz")
-        send_range(cur_start, cur_end, soft=False)
+        freq_changed = (not prev or prev.get("start") != cur_start
+                        or prev.get("end") != cur_end)
+        soft = was_started and not first and not freq_changed
+        send_range(cur_start, cur_end, soft=soft)
         return time.time()
 
     last_stderr_flush = time.time()
     last_data_time    = time.time()
-    stderr_line_count = 0   # for throttling
 
     while True:
         qsize = stdout_q.qsize()
@@ -208,11 +212,11 @@ def ws_route(ws):
             try:
                 d = json.loads(msg)
                 if d.get("cmd") == "setSweep":
-                    last_data_time = apply_sweep_cmd(d)
+                    last_data_time = apply_sweep_cmd(d, first=not started)
             except Exception as e2:
                 send_status("error", f"Command error: {e2}")
 
-        if not started and (time.time() - connect_t) > 0.6:
+        if not started and (time.time() - connect_t) > 1.5:
             proc, cur_start, cur_end = start_sweep(cur_start, cur_end, force_kill=True)
             started = True
             send_status("info", f"hackrf_sweep started {cur_start}–{cur_end} MHz")
@@ -227,22 +231,28 @@ def ws_route(ws):
                 while True: msgs.append(stderr_q.get_nowait())
             except queue.Empty: pass
             for ln in msgs:
-                # throttle: only forward 1 in every 50 "sweeps/second" lines
+                # Progress stats stay in the server terminal only — not the browser console.
                 if "sweeps/second" in ln or "sweeps completed" in ln:
-                    stderr_line_count += 1
-                    if stderr_line_count % 50 != 0:
-                        continue
+                    continue
                 lvl = "error" if any(w in ln.lower() for w in
                     ["error","fail","unable","not found","no device",
-                     "usage","open","board"]) else "warn"
+                     "usage","open","board","couldn't transfer"]) else "warn"
+                if lvl == "warn" and "caught signal" in ln.lower():
+                    continue
                 send_status(lvl, f"hackrf: {ln}")
 
         qsize = stdout_q.qsize()
         sent = 0
-        batch = min(800, max(60, qsize + 1))
+        # Decimate to the browser when the queue backs up (remote viewer on LAN).
+        skip = 1 if qsize < 200 else (2 if qsize < 500 else 3)
+        batch = min(400, max(40, qsize // skip + 1))
+        skip_i = 0
         try:
             while sent < batch:
                 line = stdout_q.get_nowait()
+                skip_i += 1
+                if skip_i % skip != 0:
+                    continue
                 try: ws.send(line + '\n')
                 except Exception: return
                 sent += 1
@@ -252,13 +262,11 @@ def ws_route(ws):
         drops = _take_drops()
         if drops:
             global last_drop_warn
-            if now - last_drop_warn > 12:
+            if now - last_drop_warn > 30:
                 last_drop_warn = now
                 send_status("warn",
-                    f"Dropped {drops} stale sweep line(s) — USB/CPU backlog. "
-                    "Try 250 kHz bin width or a narrower span.")
-            # Do NOT restart hackrf here — dropping oldest lines keeps the pipe
-            # live; killing/reopening USB makes stalls worse (issue #1).
+                    f"Display backlog: skipped {drops} old sweep line(s). "
+                    "This is normal with a remote browser — try 250 kHz bin width.")
 
         with sweep_lock:
             p = sweep_proc
@@ -1194,10 +1202,9 @@ function expectedSweepBins(){
 }
 
 function sweepLooksComplete(){
-  const exp=expectedSweepBins();
-  // Lenient threshold — strict rejection left the waterfall blank on some hosts.
-  const need=Math.max(4, Math.min(exp, Math.round(exp*0.45)));
-  return sweepBins.length >= need;
+  // Legacy threshold — strict checks left the waterfall blank when lines were
+  // decimated over LAN (remote viewer cannot keep up with 400 raw lines/s).
+  return sweepBins.length >= 4;
 }
 
 function resetSweepAssembly(){
@@ -1532,7 +1539,7 @@ function connect(){
   ws.onerror=()=>logMsg('error','WebSocket error — check server is running');
 
   lineBuf=''; resetSweepAssembly();
-  sweepActive=false;
+  sweepActive=false; initialSyncDone=false;
 
   ws.onmessage=(ev)=>{
     const raw=ev.data;
@@ -1557,14 +1564,12 @@ function connect(){
           document.title=`HackRF ${d.start}–${d.end} MHz`;
           const soft=!!d.soft;
           if(soft){
-            // Crash/stall recovery — keep waterfall history, just reset assembly.
             resetSweepAssembly();
             sweepActive=true;
-            logMsg('info',`Range reconfirmed: ${d.start}–${d.end} MHz — resuming`);
           } else {
             resetWaterfall();
             sweepActive=true;
-            logMsg('info',`Range confirmed: ${d.start}–${d.end} MHz — waterfall active`);
+            initialSyncDone=true;
           }
           drawRuler(); updateDbAxis();
           highlightCurrentBand();
@@ -1595,8 +1600,8 @@ function connect(){
 
       // detect new sweep pass
       const isNewSweep=sweepFreqLow!==null && hzLow<=expectedStartHz+5e4;
-      if(isNewSweep){
-        if(sweepLooksComplete()){
+        if(isNewSweep){
+        if(sweepBins.length>=4){
           latestBins=sweepBins.slice();
           drawSpectrum(latestBins);
           drawWaterfallLine(latestBins);
@@ -1609,12 +1614,6 @@ function connect(){
             document.getElementById('info-rate').textContent=rateCount;
             rateCount=0; lastRateTs=now;
           }
-        } else if(sweepBins.length>=4){
-          const now=Date.now();
-          if(now-lastPartialWarn>5000){
-            lastPartialWarn=now;
-            logMsg('warn',`Skipped partial sweep (${sweepBins.length}/${expectedSweepBins()} bins)`);
-          }
         }
         resetSweepAssembly();
         expectedStartHz=hzLow;
@@ -1625,7 +1624,6 @@ function connect(){
         if(sweepFreqHigh===null) sweepFreqHigh=hzHigh;
         else {
           if(lastChunkHzHigh!==null && hzLow > lastChunkHzHigh + 2e6){
-            logMsg('warn','Sweep gap detected — discarding partial frame');
             resetSweepAssembly();
             expectedStartHz=hzLow;
           }
@@ -1651,9 +1649,11 @@ function connect(){
 // ═══════════════════════════════════════════════════════════
 // CONTROLS
 // ═══════════════════════════════════════════════════════════
+let initialSyncDone=false;
+
 function sendSweepConfig(){
   if(!ws||ws.readyState!==1){logMsg('warn','Not connected');return;}
-  sweepActive=false;  // discard stale CSV until server confirms range
+  if(initialSyncDone) sweepActive=false;
   const s   =Math.max(1,Math.min(5980,+document.getElementById('start').value||88));
   const span=getSpanMhz();
   const e   =Math.min(6000,s+span);
@@ -1675,11 +1675,11 @@ function setSweep(){sendSweepConfig();}
 
 function onGainSlider(id,v,unit){
   document.getElementById(id+'-val').textContent=v+(unit||'');
-  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,400);
+  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,900);
 }
 function onAmpSlider(v){
   document.getElementById('amp-val').textContent=(+v===1)?'ON':'OFF';
-  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,400);
+  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,900);
 }
 function onDisplaySlider(id,v){
   document.getElementById(id+'-val').textContent=(+v<0?'–':'')+Math.abs(+v);
@@ -1687,7 +1687,7 @@ function onDisplaySlider(id,v){
 }
 function onBinwidthSlider(v){
   document.getElementById('bw-val').textContent=(+v/1000|0)+'k';
-  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,400);
+  clearTimeout(gainDebounceTimer); gainDebounceTimer=setTimeout(sendSweepConfig,900);
 }
 function togglePeak(){
   peakHold=!peakHold;
