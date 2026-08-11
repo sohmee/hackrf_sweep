@@ -25,6 +25,20 @@ last_drop_warn = 0.0
 _assembler_lock = threading.Lock()
 # preserved across auto-restarts so crash recovery keeps bin width / gains
 current_sweep = {"start": 88, "end": 108, "lna": 16, "vga": 20, "amp": 0, "binwidth": 100000}
+pipeline_cfg  = {"max_burst": 15, "auto_throttle": True}
+pipeline_lock = threading.Lock()
+
+def _get_pipeline():
+    with pipeline_lock:
+        return dict(pipeline_cfg)
+
+def _set_pipeline(max_burst=None, auto_throttle=None):
+    with pipeline_lock:
+        if max_burst is not None:
+            pipeline_cfg["max_burst"] = max(3, min(80, int(max_burst)))
+        if auto_throttle is not None:
+            pipeline_cfg["auto_throttle"] = bool(auto_throttle)
+        return dict(pipeline_cfg)
 
 def _note_drop(n=1):
     global dropped_lines
@@ -279,6 +293,25 @@ def ws_route(ws):
                 d = json.loads(msg)
                 if d.get("cmd") == "setSweep":
                     last_data_time = apply_sweep_cmd(d, first=not started)
+                elif d.get("cmd") == "setPipeline":
+                    cfg = _set_pipeline(d.get("maxBurst"), d.get("autoThrottle"))
+                    send_status("info",
+                        f"Pipeline: burst≤{cfg['max_burst']}, "
+                        f"auto-throttle={'on' if cfg['auto_throttle'] else 'off'}")
+                elif d.get("cmd") == "getDiagnostics":
+                    with drop_lock:
+                        pending_drops = dropped_lines
+                    try:
+                        ws.send(json.dumps({
+                            "type": "diag",
+                            "sweep_q": sweep_q.qsize(),
+                            "stdout_q": stdout_q.qsize(),
+                            "pending_drops": pending_drops,
+                            "pipeline": _get_pipeline(),
+                            "sweep": dict(current_sweep),
+                        }))
+                    except Exception:
+                        return
             except Exception as e2:
                 send_status("error", f"Command error: {e2}")
 
@@ -309,8 +342,15 @@ def ws_route(ws):
 
         qsize = sweep_q.qsize()
         sent = 0
+        cfg = _get_pipeline()
+        max_burst = cfg["max_burst"]
         # Send whole sweeps only — never partial CSV lines (prevents smeared remote display).
-        batch = min(80, max(8, qsize // 2 + 1))
+        if cfg["auto_throttle"] and qsize > 50:
+            batch = min(max_burst, max(3, qsize // 10))
+            throttle_sleep = 0.015
+        else:
+            batch = min(max_burst, max(5, qsize // 3 + 1))
+            throttle_sleep = 0
         try:
             while sent < batch:
                 sweep = sweep_q.get_nowait()
@@ -322,6 +362,8 @@ def ws_route(ws):
                 last_data_time = time.time()
         except queue.Empty:
             pass
+        if throttle_sleep and sent:
+            time.sleep(throttle_sleep)
 
         drops = _take_drops()
         if drops:
@@ -568,8 +610,22 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
 .gd{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
 .gd.ok{background:var(--acc)}.gd.warn{background:var(--warn)}
 
-/* settings modal */
+/* settings / troubleshoot modals */
 #settings-modal .mbox{width:480px}
+#troubleshoot-modal .mbox{width:560px;max-height:90vh;overflow-y:auto}
+.ts-preset{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 14px}
+.ts-preset button{height:34px;padding:0 12px;background:transparent;border:1.5px solid var(--b2);
+  color:var(--text);font-family:'Share Tech Mono',monospace;font-size:12px;cursor:pointer;border-radius:4px}
+.ts-preset button:hover{border-color:var(--acc);color:var(--acc)}
+.ts-preset button.act{border-color:var(--acc);color:var(--acc);box-shadow:0 0 8px #00ff8844}
+.ts-note{font-size:12px;color:var(--dim);line-height:1.6;margin:8px 0 12px;padding:10px 12px;
+  border-left:3px solid var(--warn);background:#ffaa2210}
+.ts-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:12px;margin:10px 0}
+.ts-grid .tk{color:var(--dim)}.ts-grid .tv{color:var(--a2);text-align:right}
+.ts-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.ts-actions button{height:34px;padding:0 12px;background:transparent;border:1.5px solid var(--a2);
+  color:var(--a2);font-family:'Share Tech Mono',monospace;font-size:12px;cursor:pointer;border-radius:4px}
+.ts-actions button.primary{border-color:var(--acc);color:var(--acc)}
 .srow{display:flex;justify-content:space-between;align-items:center;
       padding:8px 0;border-bottom:1px solid var(--b1);font-size:13px}
 .srow:last-child{border-bottom:none}
@@ -674,6 +730,7 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
     <button class="abtn" onclick="exportPNG()">↓PNG</button>
     <button class="abtn" onclick="openModal('fm-modal')">📻FM</button>
     <button class="abtn" onclick="openModal('settings-modal')">💾SETTINGS</button>
+    <button class="abtn" onclick="openTroubleshoot()">🔧TROUBLESHOOT</button>
     <button class="abtn" onclick="openModal('help-modal')">?HELP</button>
     <button class="abtn" onclick="openModal('req-modal')">⚙REQ</button>
   </div>
@@ -880,6 +937,70 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
   <div id="settings-status" style="margin-top:10px;font-size:12px;color:var(--acc)"></div>
 </div></div>
 
+<!-- ═══════════ TROUBLESHOOT MODAL ═══════════ -->
+<div id="troubleshoot-modal" class="modal" onclick="modalBackdrop(event,this)">
+<div class="mbox" id="troubleshoot-modal-box">
+  <button class="mcl" onclick="closeModal('troubleshoot-modal')">✕ CLOSE</button>
+  <h2>🔧 Troubleshooting &amp; Diagnostics</h2>
+  <div class="ts-note">
+    <b>Important:</b> We do not have a LattePanda or your exact LAN setup, so we cannot reproduce
+    remote viewing here. Fixes rely on logs and screenshots from testers like you.
+    Use the presets below to try known-good combinations, then copy the diagnostic report
+    if something still fails — one structured reply helps more than many round trips.
+  </div>
+
+  <h3>Quick Presets</h3>
+  <p style="font-size:12px;color:var(--dim);margin-bottom:6px">
+    Pick a preset, wait 30 seconds without moving sliders, then check the waterfall.
+  </p>
+  <div class="ts-preset" id="ts-preset-btns">
+    <button type="button" data-preset="local" onclick="applyPreset('local',this)">Local PC</button>
+    <button type="button" data-preset="remote" onclick="applyPreset('remote',this)" class="act">Remote LAN ★</button>
+    <button type="button" data-preset="lowbw" onclick="applyPreset('lowbw',this)">Low Bandwidth</button>
+    <button type="button" data-preset="diagnostic" onclick="applyPreset('diagnostic',this)">Diagnostic</button>
+  </div>
+  <p style="font-size:11px;color:var(--dim)">★ <b>Remote LAN</b> is recommended for Panda server + browser on another PC.</p>
+
+  <h3>Pipeline (advanced)</h3>
+  <div class="si" style="margin-bottom:8px">
+    <div class="sl"><span class="ln">Max burst (sweeps/tick)</span><span class="lv" id="ts-burst-val">15</span></div>
+    <input type="range" id="ts-max-burst" min="3" max="40" step="1" value="15"
+           oninput="onPipelineSlider('burst',this.value)">
+  </div>
+  <div class="si" style="margin-bottom:8px">
+    <div class="sl"><span class="ln">Sweep completeness (%)</span><span class="lv" id="ts-complete-val">85</span></div>
+    <input type="range" id="ts-completeness" min="50" max="95" step="5" value="85"
+           oninput="onPipelineSlider('complete',this.value)">
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);cursor:pointer">
+    <input type="checkbox" id="ts-auto-throttle" checked onchange="sendPipelineConfig()">
+    Auto-throttle when server queue backs up (recommended for remote viewing)
+  </label>
+
+  <h3>Live Diagnostics</h3>
+  <div class="ts-grid" id="ts-diag-grid">
+    <span class="tk">WebSocket</span><span class="tv" id="ts-d-ws">---</span>
+    <span class="tk">Data accepting (sweepActive)</span><span class="tv" id="ts-d-active">---</span>
+    <span class="tk">Last data received</span><span class="tv" id="ts-d-last">---</span>
+    <span class="tk">BINS (last sweep)</span><span class="tv" id="ts-d-bins">---</span>
+    <span class="tk">Expected BINS</span><span class="tv" id="ts-d-expbins">---</span>
+    <span class="tk">Draw rate (/s)</span><span class="tv" id="ts-d-rate">---</span>
+    <span class="tk">Sweeps drawn</span><span class="tv" id="ts-d-drawn">0</span>
+    <span class="tk">Sweeps rejected</span><span class="tv" id="ts-d-rejected">0</span>
+    <span class="tk">Backlog warnings</span><span class="tv" id="ts-d-backlog">0</span>
+    <span class="tk">Server sweep queue</span><span class="tv" id="ts-d-sweepq">---</span>
+    <span class="tk">Server stdout queue</span><span class="tv" id="ts-d-stdoutq">---</span>
+    <span class="tk">Active preset</span><span class="tv" id="ts-d-preset">---</span>
+    <span class="tk">Viewing mode</span><span class="tv" id="ts-d-viewer">---</span>
+  </div>
+  <div class="ts-actions">
+    <button type="button" class="primary" onclick="copyDiagnosticReport()">📋 Copy diagnostic report</button>
+    <button type="button" onclick="requestServerDiagnostics()">↻ Refresh server stats</button>
+    <button type="button" onclick="resetDiagnosticCounters()">Reset counters</button>
+  </div>
+  <div id="ts-copy-status" style="margin-top:10px;font-size:12px;color:var(--acc)"></div>
+</div></div>
+
 <!-- ═══════════ HELP MODAL ═══════════ -->
 <div id="help-modal" class="modal" onclick="modalBackdrop(event,this)">
 <div class="mbox">
@@ -933,6 +1054,8 @@ code{background:#0a1410;color:var(--acc);padding:1px 6px;border-radius:3px;
 
   <h3>Troubleshooting</h3>
   <div class="hr"><span class="hk">Blank waterfall</span><span class="hd">Check Console. Run <code>hackrf_info</code>. Check USB.</span></div>
+  <div class="hr"><span class="hk">Remote viewing</span><span class="hd">Open 🔧 TROUBLESHOOT → use <b>Remote LAN</b> preset. Panda runs server; browser on another PC.</span></div>
+  <div class="hr"><span class="hk">🔧 TROUBLESHOOT</span><span class="hd">Presets, live diagnostics, copy report for GitHub issues.</span></div>
   <div class="hr"><span class="hk">Wrong frequencies</span><span class="hd">Always use exact 20 MHz span multiples. The SPAN dropdown enforces this.</span></div>
   <div class="hr"><span class="hk">All one colour</span><span class="hd">Press ⚡ AUTO or adjust MIN/MAX dB manually.</span></div>
 </div></div>
@@ -1012,6 +1135,32 @@ let lineBuf='', ws=null;
 let gainDebounceTimer=null, freqTimer=null, resizeTimer=null;
 let currentQB=null;  // id of active quick-band button
 let lastPartialWarn=0;
+let completenessThreshold=0.85;
+let activePreset='remote';
+let tsDiagTimer=null;
+const tsStats={
+  drawnSweeps:0, rejectedSweeps:0, backlogWarnings:0,
+  lastDataTs:0, serverSweepQ:null, serverStdoutQ:null, serverPendingDrops:null,
+};
+
+const TROUBLE_PRESETS={
+  local:{
+    label:'Local PC', start:88, span:20, lna:16, vga:20, amp:0,
+    binwidth:100000, wfspeed:4, maxBurst:25, completeness:85, autoThrottle:false,
+  },
+  remote:{
+    label:'Remote LAN', start:88, span:20, lna:16, vga:20, amp:0,
+    binwidth:250000, wfspeed:8, maxBurst:10, completeness:70, autoThrottle:true,
+  },
+  lowbw:{
+    label:'Low Bandwidth', start:88, span:20, lna:16, vga:20, amp:0,
+    binwidth:500000, wfspeed:12, maxBurst:5, completeness:50, autoThrottle:true,
+  },
+  diagnostic:{
+    label:'Diagnostic', start:88, span:20, lna:16, vga:20, amp:0,
+    binwidth:250000, wfspeed:8, maxBurst:8, completeness:70, autoThrottle:true,
+  },
+};
 
 // ═══════════════════════════════════════════════════════════
 // CONSOLE  — throttle DOM updates, max 200 lines
@@ -1267,8 +1416,7 @@ function expectedSweepBins(){
 
 function sweepLooksComplete(){
   const exp=expectedSweepBins();
-  // Require most of the expected bins — partial sweeps smear when stretched to canvas width.
-  return sweepBins.length >= Math.max(8, Math.floor(exp * 0.85));
+  return sweepBins.length >= Math.max(8, Math.floor(exp * completenessThreshold));
 }
 
 function resetSweepAssembly(){
@@ -1501,7 +1649,8 @@ function recordFM(){
 // ═══════════════════════════════════════════════════════════
 const DEFAULTS={
   start:88, span:20, lna:16, vga:20, amp:0,
-  mindb:-100, maxdb:-20, binwidth:100000, wfspeed:4, scheme:'classic'
+  mindb:-100, maxdb:-20, binwidth:100000, wfspeed:4, scheme:'classic',
+  maxBurst:15, completeness:85, autoThrottle:true, preset:'remote',
 };
 function getSettingsObj(){
   return {
@@ -1515,6 +1664,10 @@ function getSettingsObj(){
     binwidth:+document.getElementById('binwidth').value,
     wfspeed:+document.getElementById('wfspeed').value,
     scheme: document.getElementById('scheme-select').value,
+    maxBurst:+document.getElementById('ts-max-burst').value,
+    completeness:+document.getElementById('ts-completeness').value,
+    autoThrottle:document.getElementById('ts-auto-throttle').checked,
+    preset:activePreset,
   };
 }
 function applySettingsObj(s){
@@ -1528,6 +1681,18 @@ function applySettingsObj(s){
   document.getElementById('binwidth').value=s.binwidth;
   document.getElementById('wfspeed').value=s.wfspeed;
   document.getElementById('scheme-select').value=s.scheme;
+  if(s.maxBurst!=null){
+    document.getElementById('ts-max-burst').value=s.maxBurst;
+    document.getElementById('ts-burst-val').textContent=s.maxBurst;
+  }
+  if(s.completeness!=null){
+    document.getElementById('ts-completeness').value=s.completeness;
+    document.getElementById('ts-complete-val').textContent=s.completeness;
+    completenessThreshold=(+s.completeness)/100;
+  }
+  if(s.autoThrottle!=null)
+    document.getElementById('ts-auto-throttle').checked=!!s.autoThrottle;
+  if(s.preset) highlightPresetButton(s.preset);
   // update displayed values
   document.getElementById('lna-val').textContent=s.lna+'dB';
   document.getElementById('vga-val').textContent=s.vga+'dB';
@@ -1554,6 +1719,7 @@ function loadSettings(){
     applySettingsObj(s);
     document.getElementById('settings-status').textContent='✓ Settings loaded';
     showSettingsPreview(s);
+    sendPipelineConfig();
     sendSweepConfig();
   }catch(e){
     document.getElementById('settings-status').textContent='Error loading settings';
@@ -1561,7 +1727,9 @@ function loadSettings(){
 }
 function factoryDefaults(){
   applySettingsObj(DEFAULTS);
+  highlightPresetButton('remote');
   document.getElementById('settings-status').textContent='↺ Factory defaults applied';
+  sendPipelineConfig();
   sendSweepConfig();
 }
 function showSettingsPreview(s){
@@ -1575,11 +1743,194 @@ document.getElementById('settings-modal').addEventListener('click',e=>{
   if(e.target.closest('.mbox')) showSettingsPreview(getSettingsObj());
 });
 
+// ═══════════════════════════════════════════════════════════
+// TROUBLESHOOTING & DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════
+function highlightPresetButton(name){
+  activePreset=name||'none';
+  document.querySelectorAll('#ts-preset-btns button').forEach(btn=>{
+    btn.classList.toggle('act', btn.dataset.preset===name);
+  });
+}
+function applyPipelineFromUi(){
+  completenessThreshold=(+document.getElementById('ts-completeness').value)/100;
+  sendPipelineConfig();
+}
+function onPipelineSlider(kind,v){
+  if(kind==='burst'){
+    document.getElementById('ts-burst-val').textContent=v;
+  } else {
+    document.getElementById('ts-complete-val').textContent=v;
+    completenessThreshold=(+v)/100;
+  }
+  highlightPresetButton('custom');
+  sendPipelineConfig();
+}
+function sendPipelineConfig(){
+  if(!ws||ws.readyState!==1) return;
+  ws.send(JSON.stringify({
+    cmd:'setPipeline',
+    maxBurst:+document.getElementById('ts-max-burst').value,
+    autoThrottle:document.getElementById('ts-auto-throttle').checked,
+  }));
+}
+function requestServerDiagnostics(){
+  if(!ws||ws.readyState!==1){
+    document.getElementById('ts-copy-status').textContent='Not connected';
+    return;
+  }
+  ws.send(JSON.stringify({cmd:'getDiagnostics'}));
+  document.getElementById('ts-copy-status').textContent='Requested server stats…';
+}
+function resetDiagnosticCounters(){
+  tsStats.drawnSweeps=0; tsStats.rejectedSweeps=0; tsStats.backlogWarnings=0;
+  document.getElementById('ts-copy-status').textContent='Counters reset';
+  refreshTroubleshootPanel();
+}
+function applyPreset(name,btn){
+  const p=TROUBLE_PRESETS[name]; if(!p) return;
+  activePreset=name;
+  highlightPresetButton(name);
+  document.getElementById('start').value=p.start;
+  document.getElementById('span-sel').value=p.span;
+  document.getElementById('lna').value=p.lna;
+  document.getElementById('vga').value=p.vga;
+  document.getElementById('amp').value=p.amp;
+  document.getElementById('binwidth').value=p.binwidth;
+  document.getElementById('wfspeed').value=p.wfspeed;
+  document.getElementById('lna-val').textContent=p.lna+'dB';
+  document.getElementById('vga-val').textContent=p.vga+'dB';
+  document.getElementById('amp-val').textContent=p.amp?'ON':'OFF';
+  document.getElementById('bw-val').textContent=(p.binwidth/1000|0)+'k';
+  document.getElementById('wfspeed-val').textContent=p.wfspeed;
+  wfSpeed=p.wfspeed;
+  document.getElementById('ts-max-burst').value=p.maxBurst;
+  document.getElementById('ts-burst-val').textContent=p.maxBurst;
+  document.getElementById('ts-completeness').value=p.completeness;
+  document.getElementById('ts-complete-val').textContent=p.completeness;
+  completenessThreshold=p.completeness/100;
+  document.getElementById('ts-auto-throttle').checked=!!p.autoThrottle;
+  updateEndDisplay();
+  resetDiagnosticCounters();
+  sendPipelineConfig();
+  sendSweepConfig();
+  document.getElementById('ts-copy-status').textContent=
+    `Applied preset: ${p.label}. Wait 30s without moving sliders.`;
+  logMsg('info',`Troubleshoot preset: ${p.label}`);
+}
+function viewerModeLabel(){
+  const host=location.hostname;
+  if(host==='localhost'||host==='127.0.0.1') return 'local browser';
+  return `remote viewer (${host})`;
+}
+function fmtAge(ms){
+  if(!ms) return 'never';
+  const s=Math.floor((Date.now()-ms)/1000);
+  if(s<2) return 'just now';
+  if(s<60) return s+'s ago';
+  return Math.floor(s/60)+'m '+s%60+'s ago';
+}
+function refreshTroubleshootPanel(){
+  const wsOk=ws&&ws.readyState===1;
+  document.getElementById('ts-d-ws').textContent=wsOk?'connected':'disconnected';
+  document.getElementById('ts-d-active').textContent=sweepActive?'yes':'NO — waiting for server';
+  document.getElementById('ts-d-last').textContent=fmtAge(tsStats.lastDataTs);
+  document.getElementById('ts-d-bins').textContent=
+    latestBins?latestBins.length:'---';
+  document.getElementById('ts-d-expbins').textContent=expectedSweepBins();
+  document.getElementById('ts-d-rate').textContent=
+    document.getElementById('info-rate').textContent;
+  document.getElementById('ts-d-drawn').textContent=tsStats.drawnSweeps;
+  document.getElementById('ts-d-rejected').textContent=tsStats.rejectedSweeps;
+  document.getElementById('ts-d-backlog').textContent=tsStats.backlogWarnings;
+  document.getElementById('ts-d-sweepq').textContent=
+    tsStats.serverSweepQ==null?'---':tsStats.serverSweepQ;
+  document.getElementById('ts-d-stdoutq').textContent=
+    tsStats.serverStdoutQ==null?'---':tsStats.serverStdoutQ;
+  document.getElementById('ts-d-preset').textContent=
+    TROUBLE_PRESETS[activePreset]?.label||activePreset;
+  document.getElementById('ts-d-viewer').textContent=viewerModeLabel();
+}
+function buildDiagnosticReport(){
+  const s=getSettingsObj();
+  const lines=[
+    '=== HackRF Sweep diagnostic report ===',
+    'Time: '+new Date().toISOString(),
+    'Viewer: '+viewerModeLabel(),
+    'Preset: '+(TROUBLE_PRESETS[activePreset]?.label||activePreset),
+    '',
+    '--- RF settings ---',
+    `Span: ${s.start}–${s.start+s.span} MHz (${s.span} MHz)`,
+    `Bin width: ${s.binwidth/1000|0} kHz`,
+    `LNA/VGA/AMP: ${s.lna}/${s.vga}/${s.amp?'ON':'OFF'}`,
+    `WF speed: ${s.wfspeed}`,
+    '',
+    '--- Pipeline ---',
+    `Max burst: ${s.maxBurst}`,
+    `Completeness threshold: ${s.completeness}%`,
+    `Auto-throttle: ${s.autoThrottle?'on':'off'}`,
+    '',
+    '--- Browser diagnostics ---',
+    `WebSocket: ${ws&&ws.readyState===1?'connected':'disconnected'}`,
+    `sweepActive: ${sweepActive}`,
+    `Last data: ${fmtAge(tsStats.lastDataTs)}`,
+    `BINS (last): ${latestBins?latestBins.length:'n/a'} (expected ~${expectedSweepBins()})`,
+    `Draw rate: ${document.getElementById('info-rate').textContent}/s`,
+    `Sweeps drawn: ${tsStats.drawnSweeps}`,
+    `Sweeps rejected: ${tsStats.rejectedSweeps}`,
+    `Backlog warnings: ${tsStats.backlogWarnings}`,
+    '',
+    '--- Server queues (last poll) ---',
+    `sweep_q: ${tsStats.serverSweepQ==null?'n/a':tsStats.serverSweepQ}`,
+    `stdout_q: ${tsStats.serverStdoutQ==null?'n/a':tsStats.serverStdoutQ}`,
+    `pending drops: ${tsStats.serverPendingDrops==null?'n/a':tsStats.serverPendingDrops}`,
+    '',
+    'If waterfall frozen but draw rate > 0, try Remote LAN preset.',
+    'If BINS << expected, try higher bin width or lower completeness %.',
+  ];
+  return lines.join('\n');
+}
+async function copyDiagnosticReport(){
+  requestServerDiagnostics();
+  await new Promise(r=>setTimeout(r,300));
+  refreshTroubleshootPanel();
+  const text=buildDiagnosticReport();
+  try{
+    await navigator.clipboard.writeText(text);
+    document.getElementById('ts-copy-status').textContent=
+      '✓ Report copied — paste into GitHub issue reply';
+  }catch(e){
+    const ta=document.createElement('textarea');
+    ta.value=text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    document.getElementById('ts-copy-status').textContent=
+      '✓ Report copied (fallback)';
+  }
+}
+function openTroubleshoot(){
+  openModal('troubleshoot-modal');
+  refreshTroubleshootPanel();
+  requestServerDiagnostics();
+  if(tsDiagTimer) clearInterval(tsDiagTimer);
+  tsDiagTimer=setInterval(refreshTroubleshootPanel, 1000);
+}
+document.getElementById('troubleshoot-modal').addEventListener('click',e=>{
+  if(e.target===document.getElementById('troubleshoot-modal')){
+    if(tsDiagTimer){clearInterval(tsDiagTimer);tsDiagTimer=null;}
+  }
+});
+
 // Try to auto-load saved settings on startup
 (function(){
   const raw=localStorage.getItem('hackrf_settings');
   if(raw){
     try{applySettingsObj(JSON.parse(raw));}catch(e){}
+  } else {
+    // First visit: pipeline tuned for common remote-viewer case
+    completenessThreshold=0.70;
+    document.getElementById('ts-completeness').value=70;
+    document.getElementById('ts-complete-val').textContent='70';
+    highlightPresetButton('remote');
   }
 })();
 
@@ -1592,7 +1943,9 @@ function connect(){
     document.getElementById('sdot').className='ok';
     document.getElementById('stxt').textContent='connected';
     logMsg('info','WebSocket connected');
+    sendPipelineConfig();
     sendSweepConfig();  // sync saved UI settings before/at sweep start
+    requestServerDiagnostics();
   };
   ws.onclose=()=>{
     document.getElementById('sdot').className='err';
@@ -1614,9 +1967,18 @@ function connect(){
         const d=JSON.parse(raw);
         if(d.type==='status'){
           logMsg(d.level||'info',d.msg);
+          if((d.msg||'').includes('Display backlog'))
+            tsStats.backlogWarnings++;
           if(d.msg.includes('hackrf: Found HackRF')||d.msg.includes('hackrf: Serial'))
             document.getElementById('device-info').textContent=
               d.msg.replace('hackrf: ','').trim();
+          return;
+        }
+        if(d.type==='diag'){
+          tsStats.serverSweepQ=d.sweep_q;
+          tsStats.serverStdoutQ=d.stdout_q;
+          tsStats.serverPendingDrops=d.pending_drops;
+          refreshTroubleshootPanel();
           return;
         }
         if(d.type==='range'){
@@ -1646,6 +2008,7 @@ function connect(){
     // ── CSV sweep data ─────────────────────────────────
     // DISCARD if server hasn't confirmed the range yet
     if(!sweepActive) return;
+    tsStats.lastDataTs=Date.now();
 
     lineBuf+=raw;
     const lines=lineBuf.split('\n');
@@ -1670,6 +2033,7 @@ function connect(){
           drawSpectrum(latestBins);
           drawWaterfallLine(latestBins);
           updateSignalMonitor(latestBins);
+          tsStats.drawnSweeps++;
           document.getElementById('info-bins').textContent=latestBins.length;
           document.getElementById('info-span').textContent=(freqEnd-freqStart).toFixed(0);
           rateCount++;
@@ -1678,6 +2042,8 @@ function connect(){
             document.getElementById('info-rate').textContent=rateCount;
             rateCount=0; lastRateTs=now;
           }
+        } else if(sweepBins.length>0) {
+          tsStats.rejectedSweeps++;
         }
         resetSweepAssembly();
         expectedStartHz=hzLow;
@@ -1837,7 +2203,12 @@ document.addEventListener('keydown',e=>{
 // MODAL HELPERS
 // ═══════════════════════════════════════════════════════════
 function openModal(id){document.getElementById(id).classList.add('open');}
-function closeModal(id){document.getElementById(id).classList.remove('open');}
+function closeModal(id){
+  document.getElementById(id).classList.remove('open');
+  if(id==='troubleshoot-modal'&&tsDiagTimer){
+    clearInterval(tsDiagTimer); tsDiagTimer=null;
+  }
+}
 function modalBackdrop(e,el){if(e.target===el)el.classList.remove('open');}
 
 // ═══════════════════════════════════════════════════════════
